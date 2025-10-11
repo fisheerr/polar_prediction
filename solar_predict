@@ -1,0 +1,287 @@
+"""
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# File       : solar_predict.py
+# Time       ：2025/1/27
+# Author     ：Yujuan
+# Description: 合并的太阳能预测文件，包含预测功能和可视化功能
+"""
+import os
+import pandas as pd
+import numpy as np
+import torch
+import pickle
+import matplotlib
+import warnings
+from models import Pyraformer
+from utils.visualize import visualize_predictions
+from utils.compute_metrics import metrics
+from utils.timefeatures import time_features
+
+# 设置matplotlib后端
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+
+# 设置pandas显示选项
+warnings.filterwarnings('ignore')
+pd.set_option('display.max_columns', None)
+pd.set_option('display.max_rows', None)
+pd.set_option('display.width', None)
+
+
+class Config:
+    """模型配置类"""
+
+    def __init__(self, batch_size, seq_len, pred_len, data_dim, label_len):
+        # 一般不需要动的参数
+        self.output_attention = 0  # 是否输出注意力
+        self.task_name = 'long_term_forecast'  # 模型的任务，一般不动但是必须有这个参数
+        self.features = 'MS'
+
+        # 模型训练
+        self.batch_size = batch_size
+        self.freq = 'h'  # 时间的频率
+        self.target = 'solarradiation'  # 评估模式时实际上不被使用
+        self.seasonal_patterns = 'Monthly'
+
+        # 模型超参数
+        self.d_model = 512  # 模型维度
+        self.n_heads = 8  # 多头注意力头数
+        self.dropout = 0.1  # 丢弃率
+        self.e_layers = 2  # 编码器块的数量
+        self.d_layers = 1  # 解码器块的数量
+        self.d_ff = 2048  # 全连接网络维度
+        self.factor = 3  # 注意力因子
+        self.activation = 'gelu'  # 激活函数
+        self.moving_avg = 25  # 移动平均
+        self.top_k = 5  # TimesBlock中的参数
+        self.num_kernels = 6  # Inception中的参数
+        self.distil = 1  # 是否使用蒸馏，1为True
+
+        # 确保关键参数：
+        self.seq_len = seq_len
+        self.label_len = label_len
+        self.pred_len = pred_len
+        self.enc_in = data_dim
+        self.dec_in = data_dim
+        self.c_out = 1  # 在长期预测中实际上不被使用
+
+
+class SolarPrediction:
+    """太阳能预测类"""
+
+    def __init__(self, scaler_path="model_pth/scaler_solar_24h_3h.pkl",
+                 weight_path="model_pth/finetuned_pyraformer_20250919_194331.pth", seq_len=24, pred_len=3, batch_size=1,
+                 label_len=3, data_dim=9):
+        """
+        初始化太阳能预测器
+
+        Args:
+            scaler_path: 标准化器路径
+            weight_path: 模型权重路径
+        """
+        self.seq_len = 24
+        self.pred_len = 3
+        self.batch_size = 1
+        self.label_len = 3
+        self.data_dim = 9
+
+        self.scaler_path = scaler_path
+        self.weight_path = weight_path
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # 加载标准化器
+        with open(scaler_path, 'rb') as f:
+            self.scaler = pickle.load(f)
+        # 创建模型配置和加载模型（直接内联模型加载逻辑）
+        config = Config(batch_size, seq_len, pred_len, data_dim, label_len)
+        self.model = Pyraformer.Model(config).to(self.device)
+
+        if os.path.isfile(self.weight_path):
+            self.model.load_state_dict(torch.load(self.weight_path, map_location=self.device))
+            self.model.eval()
+        else:
+            raise FileNotFoundError(f"权重文件 {self.weight_path} 不存在")
+
+    def load_and_preprocess_data(self, data_path, encoding='gbk'):
+        """加载和预处理数据"""
+        df = pd.read_csv(data_path, encoding=encoding)
+        df['date'] = pd.to_datetime(df['datestr'])
+        df['irradiance'] = df['irradiance'].apply(lambda x: float(np.log(1 + x)))
+        # 直接内联云层条件映射逻辑
+        df['cloud'] = df['conditions'].apply(
+            lambda x: 0 if 'Clear' in x
+            else 1 if 'Partially cloudy' in x
+            else 2 if 'Overcast' in x
+            else 2
+        )
+        df['pressure'] = df['pressure'].apply(lambda x: x / 10)
+        df.rename(columns={'irradiance': 'Target'}, inplace=True)
+        return df
+
+    def _prepare_prediction_data(self, df):
+        """准备预测数据"""
+        # 确保列顺序与训练时一致
+        expected_columns = ['temp', 'humidity', 'windspeed', 'winddir', 'pressure', 'precip', 'cloud', 'cloudcover',
+                            'Target']
+        data = df[expected_columns]
+        data_dim = data.shape[1]
+
+        # 时间特征生成
+        df_stamp = df[['date']].copy()
+        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        data_stamp = time_features(df_stamp, freq='h')
+        data_stamp = data_stamp.T
+
+        return data, data_stamp, data_dim
+
+    def _predict_data_loader(self, data, data_mark, ):
+        """正式环境专用数据加载器"""
+        # 编码器输入：取最后seq_len个点（历史数据）
+        seq_len = self.seq_len
+        label_len = self.label_len
+        pred_len = self.pred_len
+
+        x_temp = data[-seq_len:].reshape(1, seq_len, -1)  # [1, 24, 9]
+        x_temp_mark = data_mark[-seq_len:].reshape(1, seq_len, -1)  # [1, 24, 4]
+
+        # 解码器输入构造：前label_len个点（历史数据）+ 后pred_len个点（零占位）
+        dec_input = np.zeros((1, label_len + pred_len, data.shape[1]))  # [1, 6, 9]
+        dec_input[:, :label_len, :] = data[-label_len:]  # 前3个点填充历史数据,后3个点保持为0（待预测）
+        y_temp = dec_input
+
+        # 解码器时间标记：拼接编码器末尾和预测时间段 [1, 6, 4]
+        y_temp_mark = np.concatenate([
+            data_mark[-label_len:],
+            data_mark[-pred_len:]
+        ]).reshape(1, -1, data_mark.shape[1])
+
+        # 转换为Tensor
+        x_temp = torch.tensor(x_temp).float()
+        x_temp_mark = torch.tensor(x_temp_mark).float()
+        y_temp = torch.tensor(y_temp).float()
+        y_temp_mark = torch.tensor(y_temp_mark).float()
+
+        return x_temp, x_temp_mark, y_temp, y_temp_mark
+
+    def _execute_prediction(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        """执行预测"""
+        pred_len = self.pred_len
+        with torch.no_grad():
+            pred = self.model(x_enc.to(self.device), x_mark_enc.to(self.device),
+                              x_dec.to(self.device), x_mark_dec.to(self.device))
+
+        # 提取预测结果（最后pred_len个点）
+        pred = pred[:, -pred_len:, :]
+        pred = pred.cpu().numpy()
+        pred = pred.squeeze(0)
+        return pred
+
+    def predict_single(self, df):
+        """单次预测"""
+        # 数据预处理
+        data, data_stamp, data_dim = self._prepare_prediction_data(df)
+
+        # 数据归一化
+        data_inverse = self.scaler.transform(data)
+
+        # 加载数据
+        x_enc, x_mark_enc, x_dec, x_mark_dec = self._predict_data_loader(data_inverse, data_stamp)
+
+        # 执行预测
+        pred = self._execute_prediction(x_enc, x_mark_enc, x_dec, x_mark_dec)
+
+        # 反归一化
+        pred = self.scaler.inverse_transform(pred)
+        pred = np.round(pred, 3)
+
+        pred = pred.reshape(self.pred_len, data_dim)
+        pred_solar = pred[:, -1].reshape(-1, 1)
+
+        result_df = np.round(pred_solar.flatten().astype(float), 3)
+        result_df = pd.DataFrame({'irradiance': result_df})
+        return result_df['irradiance']
+
+    def run_prediction(self, df):
+        """运行预测任务"""
+        predictions = pd.DataFrame(columns=['date', 'predicted_value', 'actual_value', 'visual_value'])
+
+        for day in pd.date_range(start='2025-09-15', end='2025-09-18', freq='3h'):
+            # 切片得到当前天的数据
+            current_day_data = df[(df['date'] >= day) & (df['date'] < day + pd.Timedelta(days=1))]
+            print(current_day_data)
+
+            # 执行预测
+            predicted_values = self.predict_single(current_day_data)
+
+            # 将预测结果和实际值存储到新的 DataFrame 中
+            next_time_data = df[
+                (df['date'] >= day + pd.Timedelta(days=1)) & (df['date'] < day + pd.Timedelta(days=1, hours=3))]
+
+            new_rows = []
+            for i in range(len(next_time_data)):
+                predicted_datetime = next_time_data.iloc[i]['date']
+                new_row = pd.DataFrame({
+                    'date': [predicted_datetime],
+                    'predicted_value': [predicted_values.iloc[i]],
+                    'actual_value': [next_time_data.iloc[i]['Target']],
+                    'visual_value': [next_time_data.iloc[i]['solarradiation']],
+                })
+                new_rows.append(new_row)
+            predictions = pd.concat([predictions, *new_rows], ignore_index=True)
+
+        # 应用指数变换
+        predictions['predicted_value'] = predictions['predicted_value'].apply(lambda x: np.exp(x) - 1)
+        predictions['actual_value'] = predictions['actual_value'].apply(lambda x: np.exp(x) - 1)
+        return predictions
+
+    def plot_predictions(self, valid_data, title='predict(2025-09-15~2025-09-18)'):
+        """绘制预测结果"""
+        plt.figure(figsize=(15, 7))
+        plt.plot(valid_data['date'], valid_data['actual_value'], label='Actual', color='#2c7bb6', linewidth=2)
+        plt.plot(valid_data['date'], valid_data['predicted_value'], label='Pyraformer', color='#d7191c', linestyle='--')
+        plt.plot(valid_data['date'], valid_data['visual_value'], label='VisualCrossing', color='#fdae61', alpha=0.7)
+
+        plt.title(title, fontsize=14)
+        plt.xlabel('time', fontsize=12)
+        plt.ylabel('fsz', fontsize=12)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+
+def main():
+    """主函数"""
+    # 创建预测器实例
+    predictor = SolarPrediction()
+
+    """运行预测并可视化结果"""
+    # 加载和预处理数据
+    df = predictor.load_and_preprocess_data('data/test_data_915_918.csv')
+
+    # 运行预测
+    valid_data = predictor.run_prediction(df)
+
+    # 计算指标
+    metrics_result = {
+        'Pyraformer-Actual': metrics(valid_data['predicted_value'], valid_data['actual_value']),
+        'VisualCrossing-Actual': metrics(valid_data['visual_value'], valid_data['actual_value']),
+        'VisualCrossing-Pyraformer': metrics(valid_data['visual_value'], valid_data['predicted_value'])
+    }
+    """打印指标结果"""
+    print('Pyraformer-Actual:')
+    print(metrics_result['Pyraformer-Actual'])
+    print('VisualCrossing-Actual:')
+    print(metrics_result['VisualCrossing-Actual'])
+    print('VisualCrossing-Pyraformer:')
+    print(metrics_result['VisualCrossing-Pyraformer'])
+
+    # 绘制预测结果
+    visualize_predictions(valid_data['date'], valid_data['predicted_value'], valid_data['actual_value'],
+                          valid_data['visual_value'])
+
+
+if __name__ == "__main__":
+    main()
