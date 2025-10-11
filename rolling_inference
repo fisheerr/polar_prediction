@@ -1,0 +1,270 @@
+"""
+滚动推理模块
+实现基于微调模型的24小时滚动预测
+"""
+import torch
+import pandas as pd
+import numpy as np
+import pickle
+from datetime import datetime, timedelta
+from fine_turning.solar_model import SolarModel
+from utils.timefeatures import time_features
+from utils.visualize import visualize_predictions
+from  utils.compute_metrics import metrics
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+class RollingInference:
+    """滚动推理类，实现24小时滚动预测"""
+
+    def __init__(self, model_path, scaler_path, seq_len=24, pred_len=3):
+        """
+        初始化滚动推理器
+
+        Args:
+            model_path: 微调后的模型路径
+            scaler_path: 标准化器路径
+            seq_len: 输入序列长度（24小时）
+            pred_len: 预测长度（3小时）
+        """
+        self.model_path = model_path
+        self.scaler_path = scaler_path
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # 加载标准化器
+        with open(scaler_path, 'rb') as f:
+            self.scaler = pickle.load(f)
+
+        # 创建SolarModel实例
+        self.solar_model = SolarModel(
+            scaler_path=scaler_path,
+            seq_len=seq_len,
+            pred_len=pred_len,
+            data_dim=9
+        )
+
+        # 加载模型
+        self.model = self._load_model()
+
+    def _load_model(self):
+        """加载微调后的模型"""
+        model = self.solar_model.create_model(self.model_path)
+        model.eval()
+        return model
+
+    def _prepare_input_data(self, historical_data):
+        """
+        准备输入数据
+
+        Args:
+            historical_data: 历史数据DataFrame，包含24小时的数据
+
+        Returns:
+            processed_data: 处理后的数据
+            data_stamp: 时间特征
+        """
+        # 数据预处理
+        df = historical_data.copy()
+
+        # 处理辐照度数据
+        df['irradiance'] = df['solarradiation'].apply(lambda x: float(np.log(1 + x)))
+
+        # 处理云量数据
+        df['cloud'] = df['conditions'].apply(
+            lambda x: 0 if 'Clear' in x
+            else 1 if 'Partially cloudy' in x
+            else 2 if 'Overcast' in x
+            else 2
+        )
+
+        # 处理气压数据
+        df['pressure'] = df['pressure'].apply(lambda x: x / 10)
+        df.rename(columns={'irradiance': 'Target'}, inplace=True)
+
+        # 时间特征
+        df_stamp = df[['date']].copy()
+        data_stamp = time_features(df_stamp, freq='h')
+        data_stamp = data_stamp.T
+
+        # 确保列顺序与训练时一致
+        expected_columns = ['temp', 'humidity', 'windspeed', 'winddir', 'pressure',
+                            'precip', 'cloud', 'cloudcover', 'Target']
+        data = df[expected_columns]
+
+        # 标准化
+        data_normalized = self.scaler.transform(data)
+        return data_normalized, data_stamp
+
+    def _predict_next_window(self, x_seq, x_mark):
+        """
+        预测下一个时间窗口（3小时）
+
+        Args:
+            x_seq: 输入序列
+            x_mark: 时间特征
+
+        Returns:
+            predictions: 预测结果
+        """
+        with torch.no_grad():
+            # 转换为tensor
+            x_enc = torch.tensor(x_seq).float().unsqueeze(0).to(self.device)
+            x_mark_enc = torch.tensor(x_mark).float().unsqueeze(0).to(self.device)
+
+            # 创建解码器输入（使用输入序列的最后pred_len个时间步）
+            y_dec = x_seq[-self.pred_len:].copy()
+            y_mark_dec = x_mark[-self.pred_len:].copy()
+
+            y_dec_tensor = torch.tensor(y_dec).float().unsqueeze(0).to(self.device)
+            y_mark_dec_tensor = torch.tensor(y_mark_dec).float().unsqueeze(0).to(self.device)
+
+            # 模型预测
+            pred = self.model(x_enc, x_mark_enc, y_dec_tensor, y_mark_dec_tensor)
+            predictions = pred.cpu().numpy().squeeze()
+        return predictions
+
+    def _merge_predictions_with_weather(self, predictions, weather_data, start_time):
+        """
+        将预测结果与气象数据合并
+
+        Args:
+            predictions: 预测的辐照度值 (3个值)
+            weather_data: 未来24小时的气象数据（不包含Target）
+            start_time: 预测开始时间
+
+        Returns:
+            merged_data: 合并后的数据 (3小时的数据)
+        """
+        if 'irradiance' not in weather_data.columns:
+            weather_data['irradiance'] = ''
+        merged_data = []
+        for i in range(self.pred_len):
+            pred_time = start_time + timedelta(hours=i + 1)
+
+            # 从气象数据中获取对应时间的各字段数据
+            time_match = weather_data[weather_data['date'] == pred_time]
+            time_match.reset_index(drop=True, inplace=True)
+            # 添加预测的辐照度值
+            time_match.loc[0, 'irradiance'] = predictions[i][0]
+            merged_data.append(time_match)
+        return pd.concat(merged_data)
+
+    def rolling_predict_24h(self, historical_data, weather_data, start_time):
+        """
+        执行24小时滚动预测
+
+        Args:
+            historical_data: 历史数据（24小时）
+            start_time: 预测开始时间
+
+        Returns:
+            all_predictions: 所有预测结果
+        """
+        print("开始24小时滚动预测...")
+
+        # 准备初始数据
+        data, data_stamp = self._prepare_input_data(historical_data)
+        all_predictions = []
+        current_data = data.copy()
+        current_stamp = data_stamp.copy()
+
+        # 24小时分为8个3小时窗口
+        total_windows = 8
+
+        for window in range(total_windows):
+            print(f"预测第 {window + 1} 个时间窗口 (第 {window * 3 + 1}-{window * 3 + 3} 小时)...")
+
+            # 预测下一个3小时窗口
+            predictions = self._predict_next_window(current_data, current_stamp)
+
+            # 反标准化预测结果， 将预测结果转换为原始尺度, 辐照值至少为0
+            pred_denorm = self.scaler.inverse_transform(predictions)[:, -1:]  # [N*3, 1]
+            pred_original = np.maximum(np.exp(pred_denorm) - 1, 0.0)
+            # 记录预测结果
+            window_start = start_time + timedelta(hours=window * 3)
+            for i in range(self.pred_len):
+                pred_time = window_start + timedelta(hours=i)
+                all_predictions.append({
+                    'date': pred_time,
+                    'predicted_irradiance': pred_original[i][0],
+                    'window': window + 1,
+                    'hour_in_window': i + 1
+                })
+
+            # 如果不是最后一个窗口，准备下一次预测的数据
+            if window < total_windows - 1:
+                # 将预测结果与气象数据合并
+                merged_data = self._merge_predictions_with_weather(
+                    pred_original, weather_data, window_start
+                )
+                # 处理合并后的数据
+                merged_processed, merged_stamp = self._prepare_input_data(merged_data)
+
+                # 更新当前数据：将新的3小时数据与过去的21小时数据拼接，形成新的24小时序列
+                # 保留过去21小时的数据 + 新的3小时预测数据
+                current_data = np.vstack([current_data[-21:], merged_processed])  # 过去21小时 + 新3小时
+                current_stamp = np.vstack([current_stamp[-21:], merged_stamp])  # 对应的时间戳
+
+        return pd.DataFrame(all_predictions)
+
+
+def main():
+    """主函数，演示滚动推理过程"""
+
+    # 配置参数
+    model_path = 'model_pth/finetuned_pyraformer_20250919_194331.pth'
+    scaler_path = 'model_pth/scaler_solar_24h_3h.pkl'
+
+    # 创建滚动推理器
+    rolling_inference = RollingInference(
+        model_path=model_path,
+        scaler_path=scaler_path,
+        seq_len=24,
+        pred_len=3
+    )
+
+    # 加载历史数据（这里需要您提供实际的数据文件）
+    # 假设数据格式与训练时一致
+    try:
+        data = pd.read_csv('data/test_data_915_918.csv')
+        data['date'] = pd.to_datetime(data['datestr'])
+
+        historical_data= data.iloc[:24,:].copy()
+        weather_data = data.iloc[24:48,:].copy().reset_index(drop=True)
+
+        # historical_data= data.iloc[24:48,:].copy()
+        # weather_data = data.iloc[48:72,:].copy().reset_index(drop=True)
+
+
+        # 取最后24小时作为历史数据
+        # historical_data = data.iloc[48:72, :].copy()
+        # weather_data = data.iloc[-24:, :].copy().reset_index(drop=True)
+
+        # 设置预测开始时间
+        start_time = datetime(2025, 9, 16, 0, 0)  # 从9月18日0点开始预测
+
+        # 执行滚动预测
+        predictions = rolling_inference.rolling_predict_24h(
+            historical_data=historical_data,
+            weather_data=weather_data,
+            start_time=start_time
+        )
+
+        # 可视化结果
+        visualize_predictions(predictions['date'],predictions['predicted_irradiance'], weather_data['irradiance'])
+
+        results = metrics(predictions['predicted_irradiance'], weather_data['irradiance'])
+        print("\n=== 评估结果 ===")
+        for metric, value in results.items():
+            print(f"{metric}: {value:.6f}")
+
+    except FileNotFoundError as e:
+        print(f"数据文件未找到: {e}")
+
+
+if __name__ == "__main__":
+    main()
