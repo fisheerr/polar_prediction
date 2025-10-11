@@ -1,0 +1,282 @@
+
+import pandas as pd
+import numpy as np
+import pickle
+from models import Pyraformer
+from utils.timefeatures import time_features
+import os
+import torch
+from datetime import datetime
+
+
+class SolarModel:
+    """太阳能预测模型微调类"""
+
+    def __init__(self, scaler_path=None, epochs=10, lr=1e-5, batch_size=32, seq_len=24, pred_len=3, data_dim=9):
+        """
+        初始化SolarModel类
+
+        Args:
+            scaler_path: 标准化器路径
+            epochs: 训练轮数
+            lr: 学习率
+            batch_size: 批次大小
+            seq_len: 输入序列长度
+            pred_len: 预测序列长度
+        """
+        self.scaler_path = scaler_path
+        # 加载标准化器
+        with open(scaler_path, 'rb') as f:
+            self.scaler = pickle.load(f)
+
+        self.epochs = epochs
+        self.lr = lr
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.data_dim = data_dim
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def load_and_scaler_data(self, data_path):
+        """加载数据和标准化器"""
+        # 加载数据
+        df = pd.read_csv(data_path)
+        # 数据预处理
+        df['date'] = pd.to_datetime(df['datestr'])
+        df['pressure'] = df['pressure'].apply(lambda x: x / 10)
+        df['irradiance'] = df['irradiance'].apply(lambda x: float(np.log(1 + x)))
+        df['cloud'] = df['conditions'].apply(
+            lambda x: 0 if 'Clear' in x
+            else 1 if 'Partially cloudy' in x
+            else 2 if 'Overcast' in x
+            else 2
+        )
+        df.rename(columns={'irradiance': 'Target'}, inplace=True)
+
+        # 时间特征
+        time_stamp = df[['date']].copy()
+        data_stamp = time_features(time_stamp, freq='h')
+        data_stamp = data_stamp.T
+        time_stamp = np.array(time_stamp)
+
+        # 确保列顺序与预训练时一致：temp,humidity,windspeed,winddir,pressure,precip,cloud,cloudcover,irradiance
+        expected_columns = ['temp', 'humidity', 'windspeed', 'winddir', 'pressure', 'precip', 'cloud', 'cloudcover',
+                            'Target']
+        data = df[expected_columns]  # 按照训练时的固定顺序排列列
+        data_normalized = self.scaler.transform(data)
+
+        return data_normalized, data_stamp, time_stamp
+
+    def create_sequences(self, data, data_stamp,time_stamp):
+        """创建训练序列"""
+        seq_len = self.seq_len
+        pred_len = self.pred_len
+
+        X, y,t = [], [], []
+        for i in range(len(data) - seq_len - pred_len + 1):
+            # 输入序列
+            x_seq = data[i:i + seq_len]
+            x_mark = data_stamp[i:i + seq_len]
+
+            # 目标序列
+            y_seq = data[i + seq_len:i + seq_len + pred_len, -1:]  # 只取目标列
+            y_mark = data_stamp[i + seq_len:i + seq_len + pred_len]
+            # 时间列
+            time = time_stamp[i + seq_len:i + seq_len + pred_len, :1]
+
+            X.append((x_seq, x_mark, y_seq, y_mark))
+            y.append(y_seq)
+            t.append(time)
+
+        return X, y , t
+
+    def create_model(self, model_path):
+        """创建模型"""
+
+        class Config:
+            def __init__(self, batch_size=32, seq_len=24, pred_len=3, data_dim=9, label_len=3):
+                # 一般不需要动的参数
+                self.output_attention = 0  # 是否输出注意力
+                self.task_name = 'long_term_forecast'  # 模型的任务，一般不动但是必须有这个参数
+                self.features = 'MS'
+
+                # 模型训练
+                self.batch_size = batch_size
+                self.freq = 'h'  # 时间的频率
+                self.target = 'Target'  # 评估模式时实际上不被使用
+                self.seasonal_patterns = 'Monthly'
+                self.embed = 'timeF'
+
+                # 模型超参数
+                self.d_model = 512  # 模型维度
+                self.n_heads = 8  # 多头注意力头数
+                self.dropout = 0.1  # 丢弃率
+                self.e_layers = 2  # 编码器块的数量
+                self.d_layers = 1  # 解码器块的数量
+                self.d_ff = 2048  # 全连接网络维度
+                self.factor = 3  # 注意力因子
+                self.activation = 'gelu'  # 激活函数
+                self.moving_avg = 25  # 移动平均
+                self.top_k = 5  # TimesBlock中的参数
+                self.num_kernels = 6  # Inception中的参数
+                self.distil = 1  # 是否使用蒸馏，1为True
+                self.output_attention = 0
+
+                # 确保关键参数：
+                self.seq_len = seq_len
+                self.label_len = label_len
+                self.pred_len = pred_len
+                self.enc_in = data_dim
+                self.dec_in = data_dim
+                self.c_out = 1  # 在长期预测中实际上不被使用
+
+        # 创建模型配置
+        config = Config(batch_size=self.batch_size, seq_len=self.seq_len,
+                        pred_len=self.pred_len, data_dim=self.data_dim)
+
+        # 创建模型
+        model = Pyraformer.Model(config).to(self.device)
+
+        # 加载预训练权重
+        if os.path.isfile(model_path):
+            checkpoint = torch.load(model_path, map_location=self.device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            print("成功加载预训练模型权重")
+            self.model = model
+            return model
+        else:
+            raise FileNotFoundError(f"预训练模型权重文件 {model_path} 不存在")
+
+    def finetune_model(self, model, X, y, epochs=10, learning_rate=1e-5, batch_size=32):
+        """微调模型"""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"使用设备: {device}")
+
+        # 训练设置
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+        criterion = torch.nn.MSELoss()
+
+        # 微调训练
+        model.train()
+        train_losses = []
+
+        for epoch in range(epochs):
+            total_loss = 0
+            num_batches = 0
+
+            # 随机打乱数据
+            indices = torch.randperm(len(X))
+
+            for i in range(0, len(X), batch_size):
+                batch_indices = indices[i:i + batch_size]
+
+                # 收集批次数据
+                batch_x_enc = []
+                batch_x_mark = []
+                batch_y_dec = []
+                batch_y_mark = []
+                batch_target = []
+                for idx in batch_indices:
+                    x_seq, x_mark, y_seq, y_mark = X[idx]
+                    batch_x_enc.append(torch.tensor(x_seq).float())
+                    batch_x_mark.append(torch.tensor(x_mark).float())
+                    batch_y_dec.append(torch.tensor(y_seq).float())
+                    batch_y_mark.append(torch.tensor(y_mark).float())
+                    batch_target.append(torch.tensor(y[idx]).float())
+                # 转换为批次张量
+                batch_x_enc = torch.stack(batch_x_enc).to(device)  # [batch_size, 24, 9]
+                batch_x_mark = torch.stack(batch_x_mark).to(device)  # [batch_size, 24, 4]
+                batch_y_dec = torch.stack(batch_y_dec).to(device)  # [batch_size, 3, 1]
+                batch_y_mark = torch.stack(batch_y_mark).to(device)  # [batch_size, 3, 4]
+                batch_target = torch.stack(batch_target).to(device)  # [batch_size, 3, 1]
+
+                optimizer.zero_grad()
+
+                # 前向传播
+                pred = model(batch_x_enc, batch_x_mark, batch_y_dec, batch_y_mark)
+
+                # 计算损失
+                pred_target = pred[:, :, -1:]  # [batch_size, 3, 1] 只取目标列
+                loss = criterion(pred_target, batch_target)
+
+                # 反向传播
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            avg_loss = total_loss / num_batches
+            scheduler.step(avg_loss)
+            train_losses.append(avg_loss)
+
+            print(f'Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.6f}, LR: {optimizer.param_groups[0]["lr"]:.2e}')
+
+        # 保存微调后的模型
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_path = f'model_pth/finetuned_pyraformer_{timestamp}.pth'
+        torch.save(model.state_dict(), save_path)
+        print(f"微调完成，模型权重已保存到: {save_path}")
+        return model, save_path
+
+    def run(self, model_path, train_data, train_stamp,time_stamp):
+        """运行完整的微调流程"""
+        print("=== 模型微调 ===")
+        print(f"预训练模型: {model_path}")
+        print(f"标准化器: {self.scaler_path}")
+        print(f"训练轮数: {self.epochs}")
+        print(f"学习率: {self.lr}")
+        print(f"批次大小: {self.batch_size}")
+
+        # 加载数据
+        print("加载数据...")
+        print(f"数据形状: {train_data.shape}")
+        print(f"特征数量: {self.data_dim}")
+        X, y, t = self.create_sequences(train_data, train_stamp,time_stamp)
+        print(f"创建了 {len(X)} 个训练序列")
+
+        print("开始微调...")
+        model = self.create_model(model_path)
+        model, save_path = self.finetune_model(model, X, y, epochs=self.epochs, learning_rate=self.lr,
+                                               batch_size=self.batch_size)
+        return model, save_path
+
+    def predict(self, model_path, test_data, test_stamp,time_stamp):
+        """评估模型"""
+        # 创建SolarModel实例并运行
+        model = self.create_model(model_path)
+        X_test, y_test, t_test = self.create_sequences(test_data, test_stamp,time_stamp)
+
+        model.eval()
+        predictions = []
+        with torch.no_grad():
+            for x_seq, x_mark, y_seq, y_mark in X_test:
+                x_enc = torch.tensor(x_seq).float().unsqueeze(0).to(self.device)
+                x_mark_enc = torch.tensor(x_mark).float().unsqueeze(0).to(self.device)
+                y_dec = torch.tensor(y_seq).float().unsqueeze(0).to(self.device)
+                y_mark_dec = torch.tensor(y_mark).float().unsqueeze(0).to(self.device)
+                pred = model(x_enc, x_mark_enc, y_dec, y_mark_dec)
+                predictions.append(pred.cpu().numpy())
+        predictions = np.concatenate(predictions, axis=0).reshape(-1, 9)  # [N*3, 9]
+        targets = np.array(y_test).reshape(-1, 1)  # [N*3, 1]
+        timestr = np.array(t_test).reshape(-1, 1)  # [N*3, 1]
+        # 反标准化
+        pred_denorm = self.scaler.inverse_transform(predictions)[:, -1:]  # [N*3, 1]
+        target_denorm = self.scaler.inverse_transform(
+            np.concatenate([np.zeros((targets.shape[0], 8)), targets], axis=1)
+        )[:, -1:]  # [N*3, 1]
+
+        # 反特征变换
+        predict = np.exp(pred_denorm) - 1
+        target = np.exp(target_denorm) - 1
+
+        return predict, target , timestr
+
+
+
