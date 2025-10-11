@@ -1,0 +1,32 @@
+import matplotlib.pyplot as plt
+
+
+def visualize_predictions(date, predictions, actual_data,visual_data = None):
+    """
+    可视化预测结果
+
+    Args:
+        date: 时间
+        predictions: 预测结果DataFrame
+        actual_data: 实际数据
+    """
+
+    plt.figure(figsize=(15, 8))
+    plt.rcParams['font.sans-serif'] = ['SimHei']
+    plt.rcParams['axes.unicode_minus'] = False
+    # 绘制预测结果
+    plt.plot(date, predictions, label='预测辐照度', color='red', linewidth=2, marker='o')
+
+    plt.plot(date, actual_data, label='实际辐照度', color='blue', linewidth=2, marker='s')
+
+    if visual_data is not None:
+        plt.plot(date, visual_data, label='visualcrossing辐照度', color='#fdae61', linewidth=2, marker='*')
+
+    plt.title('24小时滚动预测结果', fontsize=16)
+    plt.xlabel('时间', fontsize=12)
+    plt.ylabel('辐照度 (W/m²)', fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
