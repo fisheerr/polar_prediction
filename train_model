@@ -1,0 +1,105 @@
+import pandas as pd
+
+from fine_turning.solar_model import SolarModel
+from utils.visualize import visualize_predictions
+from utils.compute_metrics import metrics, metrics_day
+
+
+def fine_turning():
+    # 预训练模型相关文件路径
+    data_path = 'data/pre_train_data_57_914.csv'
+    model_path = 'model_pth/solar_24h_3h_checkpoint.pth'
+    scaler_path = 'model_pth/scaler_solar_24h_3h.pkl'
+
+    # 训练模型参数值
+    epochs = 10
+    lr = 1e-5
+    batch_size = 32
+    seq_len = 24
+    pred_len = 3
+    data_dim = 9
+
+    # 创建SolarModel实例并运行
+    solar_model = SolarModel(
+        scaler_path=scaler_path,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        pred_len=pred_len,
+        data_dim=data_dim
+    )
+
+    # 分割训练和测试数据
+    data, data_stamp, time_stamp = solar_model.load_and_scaler_data(data_path)
+    test_split = 0.2
+    split_idx = int(len(data) * (1 - test_split))
+    train_data, test_data = data[:split_idx], data[split_idx:]
+    train_stamp, test_stamp = data_stamp[:split_idx], data_stamp[split_idx:]
+    train_time, test_time = time_stamp[:split_idx], time_stamp[split_idx:]
+    print(f"训练数据: {len(train_data)} 样本")
+    print(f"测试数据: {len(test_data)} 样本")
+
+    # 开始微调
+    model, save_model_path = solar_model.run(model_path, train_data, train_stamp, train_time)
+    # 评估模型
+    pred_denorm, target_denorm, time_stamp = solar_model.predict(save_model_path, test_data, test_stamp, test_time)
+    print_metrics(time_stamp, pred_denorm, target_denorm)
+
+def mode_evaluate():
+    # 预训练模型相关文件路径
+    data_path = 'data/test_data_915_918.csv'
+    model_path = 'model_pth/finetuned_pyraformer_20250919_194331.pth'
+    scaler_path = 'model_pth/scaler_solar_24h_3h.pkl'
+
+    # 训练模型参数值
+    epochs = 10
+    lr = 1e-5
+    batch_size = 32
+    seq_len = 24
+    pred_len = 3
+    data_dim = 9
+
+    # 创建SolarModel实例并运行
+    solar_model = SolarModel(
+        scaler_path=scaler_path,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        pred_len=pred_len,
+        data_dim=data_dim
+    )
+
+    test_data, test_stamp, time_stamp = solar_model.load_and_scaler_data(data_path)
+
+    # 评估模型
+    pred_denorm, target_denorm, timestr = solar_model.predict(model_path, test_data, test_stamp, time_stamp)
+    print_metrics(timestr, pred_denorm, target_denorm)
+
+def print_metrics(timestr, pred_denorm, target_denorm):
+    result = pd.DataFrame({
+        'datetime': timestr.flatten(),
+        'prediction': pred_denorm.flatten(),
+        'actual': target_denorm.flatten()
+    })
+    daily_avg = result.groupby('datetime').agg({
+        'prediction': 'mean',
+        'actual': 'mean'
+    }).reset_index()
+    daytime_metrics = metrics_day(daily_avg)
+    allday_metrics = metrics(pred_denorm, target_denorm)
+    print("\n=== 评估结果 ===")
+    print('白天预测评价指标')
+    for metric, value in daytime_metrics.items():
+        print(f"{metric}: {value:.6f}")
+    print('全天预测评价指标')
+    for metric, value in allday_metrics.items():
+        print(f"{metric}: {value:.6f}")
+
+    visualize_predictions(daily_avg['datetime'], daily_avg['prediction'], daily_avg['actual'])
+
+
+if __name__ == "__main__":
+    # fine_turning()
+    mode_evaluate()
