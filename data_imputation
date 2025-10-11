@@ -1,0 +1,186 @@
+"""
+专门用于处理辐照值数据中的空值：
+1. 晚上7点到凌晨4点的辐照值设为0
+2. 其他时间使用KNN方法进行填充
+
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import StandardScaler
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+def preprocess_solar_data_with_knn(input_file, output_file=None, target_column='宁波辐照值', k=5):
+    """
+    使用KNN方法预处理太阳能数据
+    
+    Args:
+        input_file: 输入文件路径
+        output_file: 输出文件路径（可选）
+        target_column: 目标列名
+        k: KNN的邻居数量
+    """
+    print(f"🌞 开始处理数据: {input_file}")
+    print(f"目标列: {target_column}")
+    print(f"KNN邻居数: {k}")
+
+    # 1. 加载数据
+    print("\n📁 加载数据...")
+    df = pd.read_csv(input_file)
+
+    # 处理日期列
+    if 'datestr' in df.columns:
+        df['datestr'] = pd.to_datetime(df['datestr'])
+
+    print(f"数据形状: {df.shape}")
+    print(f"日期范围: {df['datestr'].min()} 到 {df['datestr'].max()}")
+
+    # 2. 分析缺失值
+    print("\n📊 分析缺失值...")
+    missing_count = df[target_column].isna().sum()
+    total_count = len(df)
+    missing_rate = missing_count / total_count * 100
+
+    print(f"总数据量: {total_count}")
+    print(f"缺失值数量: {missing_count}")
+    print(f"缺失率: {missing_rate:.2f}%")
+
+    if missing_count == 0:
+        print("✅ 数据中没有缺失值，无需处理")
+        if output_file:
+            df.to_csv(output_file, index=False)
+        return df
+
+    # 3. 提取时间特征
+    print("\n⏰ 提取时间特征...")
+    df['hour'] = df['datestr'].dt.hour
+    df['month'] = df['datestr'].dt.month
+
+    # 4. 处理夜间时段（19:00-04:59）
+    print("\n🌙 处理夜间时段...")
+    night_hours = list(range(19, 24)) + list(range(0, 5))  # 19:00-04:59
+    night_mask = df['hour'].isin(night_hours)
+
+    # 将夜间时段的缺失值设为0
+    night_missing_mask = night_mask & df[target_column].isna()
+    df.loc[night_missing_mask, target_column] = 0
+    print(f"已将夜间时段缺失的 {night_missing_mask.sum()} 个值设为0")
+
+    # 5. 准备特征用于KNN
+    print("\n🔧 准备KNN特征...")
+
+    # 6. 使用KNN填充缺失值
+    print(f"\n🔧 使用KNN填充缺失值...")
+
+    # 只处理非夜间时段的缺失值
+    day_mask = ~df['hour'].isin(night_hours)
+    missing_mask = df[target_column].isna()
+    fill_mask = day_mask & missing_mask
+
+    missing_count = fill_mask.sum()
+    print(f"需要填充的缺失值数量: {missing_count}")
+
+    if missing_count > 0:
+        # 准备数据用于KNN
+        # 选择所有数值列进行KNN填充
+        numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+        # 移除目标列，因为我们要填充它
+        knn_columns = [col for col in numeric_columns if col != target_column]
+
+        print(f"KNN使用的列数: {len(knn_columns)}")
+
+        # 创建KNN填充器
+        knn_imputer = KNNImputer(n_neighbors=k, weights='uniform')
+
+        # 准备数据
+        df_knn = df[knn_columns + [target_column]].copy()
+
+        # 标准化数据（KNN对尺度敏感）
+        scaler = StandardScaler()
+        df_knn_scaled = pd.DataFrame(
+            scaler.fit_transform(df_knn),
+            columns=df_knn.columns,
+            index=df_knn.index
+        )
+
+        # 使用KNN填充
+        df_knn_filled = pd.DataFrame(
+            knn_imputer.fit_transform(df_knn_scaled),
+            columns=df_knn.columns,
+            index=df_knn.index
+        )
+
+        # 反标准化
+        df_knn_filled_original = pd.DataFrame(
+            scaler.inverse_transform(df_knn_filled),
+            columns=df_knn.columns,
+            index=df_knn.index
+        )
+
+        # 只更新目标列的缺失值
+        filled_values = df_knn_filled_original[target_column]
+        df.loc[fill_mask, target_column] = filled_values[fill_mask]
+
+        # 确保填充值非负
+        df.loc[fill_mask, target_column] = np.maximum(df.loc[fill_mask, target_column], 0)
+
+        print(f"✅ 成功填充 {missing_count} 个缺失值")
+
+        # 显示填充值的统计信息
+        filled_values_stats = df.loc[fill_mask, target_column]
+        print(f"填充值统计:")
+        print(f"  最小值: {filled_values_stats.min():.2f}")
+        print(f"  最大值: {filled_values_stats.max():.2f}")
+        print(f"  平均值: {filled_values_stats.mean():.2f}")
+        print(f"  标准差: {filled_values_stats.std():.2f}")
+
+    # 7. 显示处理结果摘要
+    print("\n📊 处理结果摘要:")
+    print(f"  原始数据量: {total_count}")
+    print(f"  原始缺失值: {missing_count}")
+    print(f"  夜间时段样本: {night_mask.sum()}")
+    print(f"  处理成功率: {((missing_count - df[target_column].isna().sum()) / missing_count * 100):.1f}%")
+    # 8. 保存结果
+    if output_file:
+        df.to_csv(output_file, index=False)
+        print(f"✅ 处理后的数据已保存到: {output_file}")
+    return df
+
+
+def main():
+    input = '../data/train_data_57_914.csv'
+    output = '../data/pre_train_data_57_914.csv'
+    target_column = 'irradiance'
+    k = 5
+    try:
+        # 处理数据
+        processed_df = preprocess_solar_data_with_knn(
+            input,
+            output,
+            target_column,
+            k
+        )
+
+        print("\n✅ KNN数据预处理完成!")
+
+        # 显示数据统计
+        print(f"\n📈 数据统计:")
+        print(f"  数据形状: {processed_df.shape}")
+        print(f"  目标列统计:")
+        print(f"    最小值: {processed_df[target_column].min():.2f}")
+        print(f"    最大值: {processed_df[target_column].max():.2f}")
+        print(f"    平均值: {processed_df[target_column].mean():.2f}")
+        print(f"    标准差: {processed_df[target_column].std():.2f}")
+
+    except Exception as e:
+        print(f"\n❌ KNN数据预处理失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
