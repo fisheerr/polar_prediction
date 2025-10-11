@@ -1,0 +1,217 @@
+"""
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# File       : get_zs_influx.py
+# Time       ：2025/7/22 16:37
+# Author     ：Yujuan
+"""
+
+from influxdb import InfluxDBClient
+from datetime import datetime, timedelta
+import gc
+import pandas as pd
+import pymysql
+import json
+import warnings
+import os
+
+# 忽略 pandas 的 SQLAlchemy 警告
+warnings.filterwarnings('ignore')
+
+
+class InfluxDBData(object):
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+        send_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(send_dir + '/config/config.json', 'r') as f:
+            config = json.load(f)
+        self.Influx_config = config['Influx_config']
+
+    def process_query_result(self, query_result):
+        """处理查询结果,减少内存占用"""
+        if not query_result:
+            return pd.DataFrame()
+
+        dataframes = []
+        for i, result_set in enumerate(query_result):
+            points = list(result_set)
+            if not points:
+                continue
+
+            df = pd.DataFrame(points)
+            # 优化时区转换
+            if 'time' in df.columns:
+                df['time'] = pd.to_datetime(df["time"], utc=True)
+                df["local_time"] = df['time'].dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+                df = df.drop('time', axis=1)
+
+            dataframes.append(df)
+            # 及时清理中间变量
+            del points
+            gc.collect()
+            # 合并
+        if dataframes:
+            result_df = pd.concat(dataframes, axis=1, ignore_index=False)
+            result_df = result_df.loc[:, ~result_df.columns.duplicated()]
+            # 清理临时列表
+            del dataframes
+            gc.collect()
+            return result_df
+        else:
+            return pd.DataFrame()
+
+    def fetch_from_db(self, query_start, query_end, devices):
+        """从InfluxDB获取数据
+        """
+        Influx_config = self.Influx_config
+        host = Influx_config['host']
+        port = Influx_config['port']
+        username = Influx_config['user']
+        password = Influx_config['password']
+        database = Influx_config['database']
+        # 创建InfluxDB客户端实例
+        client = InfluxDBClient(host=host, port=port, username=username, password=password, database=database)
+        # 查询每个设备的数据
+        try:
+            # 构建查询语句
+            queries = []
+            column_mapping = {}
+            for device in devices:
+                unique_alias = f"{device['functionId']}_{device['sn']}"
+                query = f"""
+                    SELECT mean({device['functionId']}) as {unique_alias}
+                    FROM wq_big_data
+                    WHERE deviceid = '{device['sn']}'
+                    AND time >= '{query_start}'
+                    AND time < '{query_end}'
+                    GROUP BY time(900s), deviceid
+                """
+                queries.append(query)
+                column_mapping[unique_alias] = device['label']
+            # 执行查询
+            combined_query = "; ".join(queries)
+            query_result = client.query(combined_query)
+
+            # 处理结果
+            df = self.process_query_result(query_result)
+            # 重命名列
+            if not df.empty:
+                # 只重命名存在的列
+                existing_columns = {k: v for k, v in column_mapping.items() if k in df.columns}
+                df = df.rename(columns=existing_columns)
+            return df
+
+        finally:
+            if client:
+                client.close()
+
+    def fetch_devices(self, start_time_str, end_time_str, devices_need):
+        try:
+            # 默认时差为8
+            time_zone = timedelta(hours=8)
+            # 优化时间转换
+            start_time = datetime.strptime(start_time_str, '%Y-%m-%d %H:%M:%S')
+            end_time = datetime.strptime(end_time_str, '%Y-%m-%d %H:%M:%S')
+
+            # 简化时区转换逻辑
+            utc_start = start_time - time_zone
+            utc_end = end_time - time_zone
+            query_start = utc_start.isoformat() + 'Z'
+            query_end = utc_end.isoformat() + 'Z'
+
+            # 读取实时变频器功率
+            result = self.fetch_from_db(query_start, query_end, devices_need)
+            return result
+        except Exception as e:
+            print(f"获取设备数据时发生错误: {e}")
+            return pd.DataFrame()
+
+    def get_nb_irradiance_data(self):
+        # 宁波辐照度相关信息
+        devices_need = [
+            {"functionId": "fsz", 'sn': "SN202504080161", 'label': "irradiance"},
+        ]
+        try:
+            pv_true = self.fetch_devices(self.start, self.end, devices_need)
+            if len(pv_true) != 0:
+                if 'time' in pv_true.columns:
+                    pv_true = pv_true.drop('time', axis=1)
+                pv_true['local_time'] = pd.to_datetime(pv_true['local_time'])
+                pv_true = pv_true.groupby('local_time').mean()
+                pv_true_hourly = pv_true.resample('1h').mean()
+                pv_true_hourly = pv_true_hourly.reset_index()
+                pv_true_hourly.rename(columns={'local_time': 'datestr'}, inplace=True)
+                return pv_true_hourly
+            else:
+                print('获取宁波辐照度数据为空')
+        except Exception as e:
+            print('获取宁波辐照度数据出错：' + str(e))
+
+
+class MysqlData(object):
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+        send_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(send_dir + '/config/config.json', 'r') as f:
+            config = json.load(f)
+        self.db_config = config['Mysql']
+
+    def tmp_mysql_solar_data(self):
+        start_time = pd.to_datetime(self.start) - timedelta(days=1)
+        end_time = pd.to_datetime(self.end) - timedelta(days=1)
+        conn = pymysql.connect(**self.db_config)
+
+        # 宁波经纬度
+        longitude = 121.50012
+        latitude = 29.958956
+        columns = ['temp', 'winddir', 'humidity', 'windspeed', 'pressure', 'precip', 'conditions',                        'cloudcover',
+                   'solarradiation', 'icon']
+        table_name = 'sa_om_weather_day_time'
+        columns_str = ", ".join([f"{col}" for col in columns])
+        # 构建查询语句
+        query = (
+            f"SELECT concat(daystr, ' ', datetime) as datestr, {columns_str} FROM {table_name} B where "
+            f"latitude = {latitude} AND longitude = {longitude} AND daystr >= '{start_time}' AND daystr <= '{end_time}' "
+            f"ORDER BY B.daystr ASC, B.datetime ASC")
+
+        try:
+            df = pd.read_sql(query, conn)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            df = None
+        finally:
+            if conn:
+                conn.close()
+        return df
+
+    def get_solar_data(self):
+        solar_data = self.tmp_mysql_solar_data()
+        solar_data['datestr'] = pd.to_datetime(solar_data['datestr'])
+        if len(solar_data) == 0:
+            print('获取气象预报相关特征变量数据为空')
+            return None
+        solar_data.set_index('datestr', drop=True)
+        solar_data.dropna(axis=1, how='all', inplace=True)
+        return solar_data
+
+
+def get_data(start, end, save_path):
+    # 宁波实测辐照值
+    influx_data = InfluxDBData(start, end)
+    actual_irradiance = influx_data.get_nb_irradiance_data()
+
+    # visualcrossing气象预报
+    sql_data = MysqlData(start, end)
+    weather_forecast = sql_data.get_solar_data()
+    merge_data = pd.merge(weather_forecast, actual_irradiance, how='left', on='datestr')
+    merge_data.to_csv(save_path,index=False)
+
+
+if __name__ == "__main__":
+    # 获取训练数据
+    get_data('2025-05-07 00:00:00', '2025-09-15 00:00:00', '../data/train_data_57_914.csv')
+    # 获取测试数据
+    get_data('2025-09-15 00:00:00', '2025-09-19 00:00:00', '../data/test_data_915_918.csv')
