@@ -1,0 +1,54 @@
+import warnings
+import numpy as np
+import pandas as pd
+from sklearn.metrics import r2_score
+
+warnings.filterwarnings('ignore')
+
+
+def metrics(pred, true):
+    """计算评估指标"""
+    mae = np.mean(np.abs(pred - true))
+    mse = np.mean((pred - true) ** 2)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(pred, true)
+    results = {'MAE': float(mae), 'MSE': float(mse), 'RMSE': float(rmse), 'R2': r2}
+    return results
+
+def metrics_day(df):
+    """
+    计算剔除夜晚数据的评估指标
+    剔除晚上7点到凌晨4点的数据
+    
+    Parameters:
+    df: pandas.DataFrame
+        包含时间、预测值、真实值三列的DataFrame
+        列名应为:   ['datetime', 'prediction', 'actual'] 等
+    
+    Returns:
+    dict: {mae, mse, rmse, r2} 评估指标
+    """
+    # 确保时间列是datetime类型
+    time_col = 'datetime'
+    pred_col = 'prediction'
+    true_col = 'actual'
+
+
+    # 转换时间列为datetime类型
+    df[time_col] = pd.to_datetime(df[time_col])
+    
+    # 提取小时信息
+    df['hour'] = df[time_col].dt.hour
+    
+    # 剔除晚上7点到凌晨4点的数据 (19:00-23:59 和 00:00-04:59)
+    daytime_mask = ~((df['hour'] >= 19) | (df['hour'] <= 4))
+    daytime_df = df[daytime_mask]
+    
+    if len(daytime_df) == 0:
+        raise ValueError("剔除夜晚数据后没有剩余数据")
+    
+    # 计算评估指标
+    pred = daytime_df[pred_col].values
+    true = daytime_df[true_col].values
+    results = metrics(pred, true)
+    return results
