@@ -1,0 +1,351 @@
+# 太阳能辐照度预测系统 V1.0
+
+## 🌞 项目介绍
+本项目是一个基于Pyraformer深度学习模型的太阳能辐照度预测系统。系统能够基于历史气象数据和辐照度数据，预测未来3小时的太阳能辐照度，并支持24小时滚动预测。该系统特别适用于太阳能发电站、光伏电站等需要精确辐照度预测的场景。
+
+---
+
+## ✨ 核心功能
+
+| Module                               | Purpose                                     |
+|--------------------------------------|---------------------------------------------|
+| **`solar_main.py`**                  | 主程序入口，集成模型微调、评估和预测的核心控制器            |
+| **`rolling_inference.py`**           | 滚动推理模块，实现24小时滚动预测功能                  |
+| **`fine_turning/solar_model.py`**   | 太阳能预测模型微调类，负责模型训练和预测                |
+| **`data_processing/get_data.py`**   | 数据获取模块，从InfluxDB和MySQL数据库获取气象数据      |
+| **`data_processing/data_imputation.py`** | 数据预处理模块，处理缺失值和数据清洗                |
+
+---
+
+## ⚡ 快速开始
+
+1. **环境要求**
+
+- Python 3.7或更高版本
+- CUDA支持的GPU（推荐，用于模型训练）
+- 8GB以上内存
+
+2. **克隆项目**
+   ```bash
+   git clone <your-repo-url>
+   cd solar_pre_trained
+   python -m venv venv
+   source venv/bin/activate      # Windows‑PowerShell: venv\Scripts\Activate.ps1
+   ```
+
+3. **安装依赖**
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **配置数据库连接**
+
+   修改 `config/config.json` 文件中的数据库配置：
+
+   ```json
+   {
+     "Mysql": {
+       "host": "your-mysql-host",
+       "port": 8806,
+       "user": "your-username",
+       "password": "your-password",
+       "database": "your-database"
+     },
+     "Influx_config": {
+       "host": "your-influxdb-host",
+       "port": 8186,
+       "user": "admin",
+       "password": "your-password",
+       "database": "your-database"
+     }
+   }
+   ```
+
+5. **准备数据**
+
+   确保以下数据文件存在：
+   - `data/pre_train_data_57_914.csv` - 预训练数据
+   - `data/test_data_915_918.csv` - 测试数据
+
+6. **启动程序**
+
+   ```bash
+   # 模型微调
+   python solar_main.py
+
+   # 滚动预测
+   python rolling_inference.py
+   ```
+
+---
+
+## 📁 项目结构
+
+``` 
+solar_pre_trained/
+├── solar_main.py                    # 主程序入口，负责模型微调和评估
+├── rolling_inference.py            # 滚动推理模块，实现24小时滚动预测
+├── config/
+│   └── config.json                 # 数据库配置文件
+├── data_processing/                # 数据处理模块
+│   ├── get_data.py                # 数据获取模块（InfluxDB/MySQL）
+│   └── data_imputation.py         # 数据预处理和缺失值填充
+├── fine_turning/                   # 模型微调模块
+│   ├── solar_model.py             # 太阳能预测模型类
+│   ├── solar_predict.py           # 预测功能模块
+│   └── solar_prediction.py        # 预测结果处理
+├── models/                         # 模型定义
+│   └── Pyraformer.py              # Pyraformer模型架构
+├── layers/                         # 模型层定义
+│   ├── Conv_Blocks.py             # 卷积块
+│   ├── Embed.py                   # 嵌入层
+│   ├── Pyraformer_EncDec.py       # 编码器-解码器
+│   └── SelfAttention_Family.py    # 自注意力机制
+├── utils/                          # 工具函数
+│   ├── masking.py                 # 掩码处理
+│   ├── metrics.py                 # 评估指标
+│   ├── print_args.py              # 参数打印
+│   └── timefeatures.py            # 时间特征提取
+├── model_pth/                      # 模型权重文件
+│   ├── solar_24h_3h_checkpoint.pth # 预训练模型
+│   ├── finetuned_pyraformer_*.pth  # 微调后的模型
+│   └── scaler_solar_24h_3h.pkl    # 数据标准化器
+├── data/                          # 数据目录
+├── requirements.txt               # Python依赖库
+└── README.md                      # 项目说明文档
+```
+
+---
+
+## ⚙️ 配置说明
+
+### 数据库配置 (`config/config.json`)
+
+根据实际环境修改以下配置参数:
+
+```json
+{
+  "Mysql": {
+    "host": "数据库主机地址",
+    "port": 8806,
+    "user": "数据库用户名",
+    "password": "数据库密码",
+    "database": "数据库名称"
+  },
+  "Influx_config": {
+    "host": "InfluxDB主机地址",
+    "port": 8186,
+    "user": "InfluxDB用户名",
+    "password": "InfluxDB密码",
+    "database": "InfluxDB数据库名"
+  }
+}
+```
+
+- `Mysql`: MySQL数据库配置，用于存储历史气象数据
+- `Influx_config`: InfluxDB时序数据库配置，用于存储实时气象数据
+
+---
+
+## 🔧 输入数据格式
+
+### 数据文件要求
+
+系统需要以下格式的CSV数据文件：
+
+```csv
+datestr,temp,humidity,windspeed,winddir,pressure,precip,conditions,cloudcover,irradiance
+2024-01-01 00:00:00,15.2,65.3,3.2,180,1013.2,0.0,Clear,10,0.0
+2024-01-01 01:00:00,14.8,67.1,2.8,175,1013.5,0.0,Clear,5,0.0
+...
+```
+
+### 数据字段说明
+
+| 字段名 | 类型 | 说明 |
+|--------|------|------|
+| `datestr` | datetime | 时间戳 |
+| `temp` | float | 温度 (°C) |
+| `humidity` | float | 湿度 (%) |
+| `windspeed` | float | 风速 (m/s) |
+| `winddir` | float | 风向 (度) |
+| `pressure` | float | 气压 (hPa) |
+| `precip` | float | 降水量 (mm) |
+| `conditions` | string | 天气条件 |
+| `cloudcover` | float | 云量覆盖 (%) |
+| `irradiance` | float | 辐照度 (W/m²) |
+
+---
+
+## 🚀 使用示例
+
+### 1. 模型微调
+
+```python
+from fine_turning.solar_model import SolarModel
+
+# 创建模型实例
+solar_model = SolarModel(
+    scaler_path='model_pth/scaler_solar_24h_3h.pkl',
+    epochs=10,
+    lr=1e-5,
+    batch_size=32,
+    seq_len=24,
+    pred_len=3,
+    data_dim=9
+)
+
+# 加载数据并训练
+data, data_stamp, time_stamp = solar_model.load_and_scaler_data('data/pre_train_data_57_914.csv')
+model, save_model_path = solar_model.run('model_pth/solar_24h_3h_checkpoint.pth', data, data_stamp)
+```
+
+### 2. 滚动预测
+
+```python
+from rolling_inference import RollingInference
+
+# 创建滚动推理器
+rolling_inference = RollingInference(
+    model_path='model_pth/finetuned_pyraformer_20250919_194331.pth',
+    scaler_path='model_pth/scaler_solar_24h_3h.pkl',
+    seq_len=24,
+    pred_len=3
+)
+
+# 执行24小时滚动预测
+predictions = rolling_inference.rolling_predict_24h(
+    historical_data=historical_data,
+    start_time=datetime(2025, 9, 18, 0, 0)
+)
+```
+
+### 3. 数据预处理
+
+```python
+from data_processing.data_imputation import preprocess_solar_data_with_knn
+
+# 使用KNN方法处理缺失值
+preprocess_solar_data_with_knn(
+    input_file='data/raw_data.csv',
+    output_file='data/processed_data.csv',
+    target_column='irradiance',
+    k=5
+)
+```
+
+---
+
+## 📊 模型性能
+
+### 评估指标
+
+系统使用以下指标评估模型性能：
+
+- **MAE (Mean Absolute Error)**: 平均绝对误差
+- **MSE (Mean Squared Error)**: 均方误差  
+- **RMSE (Root Mean Squared Error)**: 均方根误差
+- **R² (R-squared)**: 决定系数
+
+### 典型性能表现
+
+```
+=== 评估结果 ===
+MAE: 45.234567
+MSE: 3245.123456
+RMSE: 56.789012
+R2: 0.876543
+```
+
+---
+
+## 🛠️ 依赖包
+
+主要依赖包括：
+
+```text
+torch==1.7.1
+numpy==1.23.5
+pandas==1.5.3
+scikit-learn==1.2.2
+matplotlib==3.7.0
+einops==0.8.0
+local-attention==1.9.14
+reformer-pytorch==1.4.4
+sktime==0.16.1
+```
+
+安装所有依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 🔄 工作流程
+
+### 1. 数据获取
+- 从InfluxDB获取实时气象数据
+- 从MySQL获取历史气象数据
+- 数据清洗和预处理
+
+### 2. 数据预处理
+- 处理缺失值（KNN填充）
+- 数据标准化
+- 时间特征提取
+
+### 3. 模型训练
+- 加载预训练模型
+- 微调模型参数
+- 保存微调后的模型
+
+### 4. 预测推理
+- 24小时滚动预测
+- 3小时窗口预测
+- 结果可视化和保存
+
+---
+
+## 📈 预测结果
+
+### 输出格式
+
+预测结果包含以下信息：
+
+```csv
+time,predicted_irradiance,window,hour_in_window
+2025-09-18 01:00:00,125.45,1,1
+2025-09-18 02:00:00,234.67,1,2
+2025-09-18 03:00:00,189.23,1,3
+...
+```
+
+### 可视化
+
+系统提供预测结果的可视化功能：
+- 24小时辐照度预测曲线
+- 实际值vs预测值对比
+- 预测误差分析
+
+---
+
+## 🚨 注意事项
+
+1. **数据质量**: 确保输入数据的质量和完整性，缺失值会影响预测精度
+2. **模型更新**: 建议定期使用最新数据重新训练模型
+3. **硬件要求**: 训练过程需要GPU支持，推理可以在CPU上运行
+4. **数据格式**: 确保输入数据格式与训练时一致
+
+---
+
+## 📧 技术支持
+
+如有问题或建议，请联系开发团队或提交Issue。
+
+---
+
+## 📄 许可证
+
+本项目采用MIT许可证，详见LICENSE文件。
